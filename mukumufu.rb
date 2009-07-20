@@ -1,108 +1,226 @@
-# generates Makefile.inc.txt for nmake
+# Makefile.inc.txtを生成する。
+# 内容は以下のとおり：
+#   ・OBJS = main.cに必要なモジュール(obj)
+#   ・.hファイルの.hファイルへの依存関係
+#   ・.cファイルの.hファイルへの依存関係
+#   ・.objファイルの.cファイルへの依存関係
+
+require 'set'
+require 'enumerator'
+require 'kconv'
+
+module Enumerable
+  def dfs(visited = Set.new, &blk)
+    return if visited.include?(self)
+    
+    blk.call self
+    visited << self
+    
+    each {|x| x.dfs(visited, &blk) }
+  end
+end
 
 class Mukumufu
-  def make
-    @libs = make_libs
-    @deptable = make_deptable
-    @cs = make_cs
-    @objs = make_objs
+  attr_reader :objs, :includes, :source_header_dependencies, :object_source_dependencies, :header_header_dependencies
+  
+  def write(f = STDOUT)
+    calculate unless @calculated
     
-    template
-  end
-
-  private
-
-  attr_reader :cs, :libs, :deptable, :objs
-  
-
-  # calculation
-  
-  def make_libs
-    Dir['lib/*.lib']
+    f.puts objs
+    f.puts
+    f.puts header_header_dependencies
+    f.puts
+    f.puts source_header_dependencies
+    f.puts
+    f.puts object_source_dependencies
   end
   
-  def make_cs
-    # calculate fixpoint of deptable
+  def calculate
+    sources = Sources.new(Dir['src/**/*.[ch]'])
     
-    deptable['main.c']
-    old_size = 1
-    cs = nil
+    includes = sources.header_dirs
     
-    while true
-      cs = make_current_cs
-      old_size = deptable.size
-      cs.each {|c| deptable[c] }
-      break if old_size == deptable.size
+    hhdeps = {}
+    shdeps = {}
+    osdeps = {}
+    
+    main = sources['main.c']
+    all = main.all_related_sources
+    
+    all.each do |source|
+      if source.header?
+        h = source
+        hhdeps[h.path] = h.depending_headers
+      else
+        c = source
+        osdeps[obj_path(c.name)] = [c]
+        shdeps[c] = c.depending_headers
+      end
     end
     
-    cs.sort.uniq
+    objs = osdeps.keys
+    
+    @objs = file_list('OBJS', objs, %_ \\\n  _)
+    @header_header_dependencies = dep_list(hhdeps)
+    @source_header_dependencies = dep_list(shdeps)
+    @object_source_dependencies = dep_list(osdeps, compile_command(includes))
+    @calculated = true
+    self
   end
   
-  def make_current_cs
-    deptable.
-      values.
-      flatten.
-      map {|h| deptable[h]; h.gsub(/\.h\z/, '.c') }.
-      select {|c| File.exist? src(c) }.
-      unshift('main.c')
-  end
-
-  def make_objs
-    cs.map {|c| "$(OBJDIR)/#{c.gsub(/c\z/, '$(O)')}" }
+  private
+  def obj_path(name)
+    "$(OBJDIR)/#{name.gsub(/\.c\z/, '.$(O)')}"
   end
   
-  def src(x)
-    "src/#{x}"
-  end
-  
-  def grep_headers(filename)
-    IO.read(src(filename)).
-      scan(/^#\s*include\s*"([^"]*)"$/).
-      select {|x| File.exist? src(x) }.flatten
-  end
-  
-  def make_deptable
-    Hash.new {|h,k| h[k] = grep_headers(k) }
-  end
-  
-  # stringification
-  
-  def dirlist(list)
-    str = list.join(%_ \\\n  _)
+  def file_list(name, list, separator)
+    str = (["#{name} ="] + list.sort).join(separator)
     str.gsub!('/', '\\') if windows?
     str
   end
   
-  def windows?
-    RUBY_PLATFORM =~ /mswin(?!ce)|mingw|cygwin|bccwin/
-  end
-  
-  def header_dependency
-    deptable.
+  def dep_list(hash, command=nil)
+    command &&= "\n\t#{command}\n"
+    
+    str = hash.
       reject {|k,v| v.empty? }.
-      map {|c,h| "#{c}: #{h.join(' ')}" }.
+      map {|c,h| "#{c}: #{h.map {|x| x.to_s }.sort.join(' ')}#{command}" }.
+      sort.
       join("\n")
+    str.gsub!('/', '\\') if windows?
+    str
   end
   
-  def template
-    <<-EOS
-OBJS = \\
-  #{dirlist(objs)}
-
-LIBS = \\
-  #{dirlist(libs)}
-
-#{header_dependency}
-    EOS
+  def compile_command(includes)
+    inc = includes.map {|x| "-I#{x}" }.join(" ")
+    if windows?
+      o = "-Fo$@ -c $?"
+    else
+      o = '-o $@ -c $<'
+    end
+    "$(CC) $(CFLAGS) #{inc} #{o}"
+  end
+  
+  def windows?
+    @windows ||= RUBY_PLATFORM =~ /mswin(?!ce)|mingw|bccwin/
   end
 end
 
+class Sources
+  include Enumerable
+  
+  def initialize(files)
+    @sources = files.map {|f| Source.new(self, f) }
+  end
+  
+  def header_dirs
+    @header_dirs ||= make_header_dirs
+  end
+  
+  def [](name)
+    @index_cache ||= {}
+    @index_cache[name] ||= find_file(name)
+  end
+  
+  def each(&blk)
+    @sources.each(&blk)
+  end
+  
+  private
+  def make_header_dirs
+    @sources.map {|s| s.dir if s.header? }.compact.sort.uniq
+  end
+  
+  def find_file(str)
+    files = @sources.select {|s| s.path == str || s.name == str }
+    
+    case files.size
+    when 1
+      files[0]
+    when 0
+      nil
+    else
+      raise "file name conflict: #{files.inspect}"
+    end
+  end
+end
+
+class Source
+  attr_reader :path
+  
+  include Enumerable
+  
+  def initialize(sources, path)
+    @sources = sources
+    @path = path
+  end
+  
+  alias to_s path
+  
+  def name
+    @name ||= File.basename(path)
+  end
+  
+  def ext
+    @ext ||= File.extname(path)
+  end
+  
+  def dir
+    @dir ||= File.dirname(path)
+  end
+  
+  def header?
+    ext == '.h' || ext == '.hpp'
+  end
+  
+  def each(&blk)
+    depending_headers.each(&blk)
+    depending_sources.each(&blk)
+  end
+  
+  def all_related_sources
+    enum_for(:dfs).to_set
+  end
+  
+  def depending_headers
+    @depending_headers ||= make_depending_headers
+  end
+  
+  def depending_sources
+    @depending_sources ||= make_depending_sources
+  end
+  
+  private
+  def make_depending_headers
+    headers = IO.read(path).toutf8.scan(/^#\s*include\s*"([^"]*)"$/i)
+    headers.map {|header_name| @sources[header_name[0]] }.compact
+  end
+  
+  def make_depending_sources
+    depending_headers.map {|h| find_source(h) }.compact
+  end
+  
+  def find_source(h)
+    @sources[h_to_c(h.path)] || @sources[h_to_cpp(h.path)]
+  end
+  
+  def h_to_c(path)
+    path.gsub(/\.h\z/, '.c')
+  end
+  
+  def h_to_cpp(path)
+    path.gsub(/\.h\z/, '.cpp')
+  end
+end
 
 def main
-  text = Mukumufu.new.make
+  m = Mukumufu.new
+  m.calculate
   
-  open('Makefile.inc.txt', 'w') do |f|
-    f << text
+  if ARGV.include?('-n')
+    m.write
+  else
+    open('Makefile.inc.txt', 'w') {|f| m.write f }
   end
 end
 
