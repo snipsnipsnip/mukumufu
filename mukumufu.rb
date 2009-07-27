@@ -194,7 +194,7 @@ class Mukumufu
       cpp = h_to_cpp(h)
       
       if c && cpp
-        raise FileNameConflictError, %_both "#{c.path}" and "#{cpp.path}" exists for header "#{h.path}"_
+        raise FileNameConflictError, %_both "#{c}" and "#{cpp}" exists for header "#{h}"_
       end
       
       c || cpp
