@@ -1,9 +1,4 @@
-# Makefile.inc.txtを生成する。
-# 内容は以下のとおり：
-#   ・OBJS = main.cに必要なモジュール(obj)
-#   ・.hファイルの.hファイルへの依存関係
-#   ・.cファイルの.hファイルへの依存関係
-#   ・.objファイルの.cファイルへの依存関係
+# generates Makefile.inc.txt
 
 require 'set'
 require 'enumerator'
@@ -36,7 +31,7 @@ class Mukumufu
   end
   
   def calculate
-    sources = Sources.new(Dir['src/**/*.[ch]'])
+    sources = Sources.new(Dir['src/**/*.{c,h,cpp,hpp}'])
     
     includes = sources.header_dirs
     
@@ -75,7 +70,6 @@ class Mukumufu
   
   def file_list(name, list, separator)
     str = (["#{name} ="] + list.sort).join(separator)
-    str.gsub!('/', '\\') if windows?
     str
   end
   
@@ -87,22 +81,13 @@ class Mukumufu
       map {|c,h| "#{c}: #{h.map {|x| x.to_s }.sort.join(' ')}#{command}" }.
       sort.
       join("\n")
-    str.gsub!('/', '\\') if windows?
     str
   end
   
   def compile_command(includes)
     inc = includes.map {|x| "-I#{x}" }.join(" ")
-    if windows?
-      o = "-Fo$@ -c $?"
-    else
-      o = '-o $@ -c $<'
-    end
+    o = "$(CC_OBJ_OUT_FLAG)$@ -c $?"
     "$(CC) $(CFLAGS) #{inc} #{o}"
-  end
-  
-  def windows?
-    @windows ||= RUBY_PLATFORM =~ /mswin(?!ce)|mingw|bccwin/
   end
 end
 
@@ -140,8 +125,11 @@ class Sources
     when 0
       nil
     else
-      raise "file name conflict: #{files.inspect}"
+      raise FileNameConflictError, "file name conflict: #{files.map {|x| x.path }.inspect}"
     end
+  end
+  
+  class FileNameConflictError < StandardError
   end
 end
 
@@ -201,15 +189,22 @@ class Source
   end
   
   def find_source(h)
-    @sources[h_to_c(h.path)] || @sources[h_to_cpp(h.path)]
+    c = h_to_c(h)
+    cpp = h_to_cpp(h)
+    
+    if c && cpp
+      raise "both c and cpp exists for header \"#{h.path}\""
+    end
+    
+    c || cpp
   end
   
-  def h_to_c(path)
-    path.gsub(/\.h\z/, '.c')
+  def h_to_c(h)
+    @sources[h.path.gsub(h.ext, '.c')]
   end
   
-  def h_to_cpp(path)
-    path.gsub(/\.h\z/, '.cpp')
+  def h_to_cpp(h)
+    @sources[h.path.gsub(h.ext, '.cpp')]
   end
 end
 
