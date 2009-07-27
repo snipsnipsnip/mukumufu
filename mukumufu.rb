@@ -1,4 +1,9 @@
-# generates Makefile.inc.txt
+# Makefile.inc.txtを生成する。
+# 内容は以下のとおり：
+#   ・OBJS = main.cに必要なモジュール(obj)
+#   ・.hファイルの.hファイルへの依存関係
+#   ・.cファイルの.hファイルへの依存関係
+#   ・.objファイルの.cファイルへの依存関係
 
 require 'set'
 require 'enumerator'
@@ -89,126 +94,126 @@ class Mukumufu
     o = "$(CC_OBJ_OUT_FLAG)$@ -c $?"
     "$(CC) $(CFLAGS) #{inc} #{o}"
   end
-end
 
-class Sources
-  include Enumerable
-  
-  def initialize(files)
-    @sources = files.map {|f| Source.new(self, f) }
-  end
-  
-  def header_dirs
-    @header_dirs ||= make_header_dirs
-  end
-  
-  def [](name)
-    @index_cache ||= {}
-    @index_cache[name] ||= find_file(name)
-  end
-  
-  def each(&blk)
-    @sources.each(&blk)
-  end
-  
-  private
-  def make_header_dirs
-    @sources.map {|s| s.dir if s.header? }.compact.sort.uniq
-  end
-  
-  def find_file(str)
-    files = @sources.select {|s| s.path == str || s.name == str }
+  class Sources
+    include Enumerable
     
-    case files.size
-    when 1
-      files[0]
-    when 0
-      nil
-    else
-      raise FileNameConflictError, "file name conflict: #{files.map {|x| x.path }.inspect}"
+    def initialize(files)
+      @sources = files.map {|f| Source.new(self, f) }
+    end
+    
+    def header_dirs
+      @header_dirs ||= make_header_dirs
+    end
+    
+    def [](name)
+      @index_cache ||= {}
+      @index_cache[name] ||= find_file(name)
+    end
+    
+    def each(&blk)
+      @sources.each(&blk)
+    end
+    
+    private
+    def make_header_dirs
+      @sources.map {|s| s.dir if s.header? }.compact.sort.uniq
+    end
+    
+    def find_file(str)
+      files = @sources.select {|s| s.path == str || s.name == str }
+      
+      case files.size
+      when 1
+        files[0]
+      when 0
+        nil
+      else
+        raise FileNameConflictError, "file name conflict: #{files.map {|x| x.path }.inspect}"
+      end
     end
   end
-  
+
+  class Source
+    attr_reader :path
+    
+    include Enumerable
+    
+    def initialize(sources, path)
+      @sources = sources
+      @path = path
+    end
+    
+    alias to_s path
+    
+    def name
+      @name ||= File.basename(path)
+    end
+    
+    def ext
+      @ext ||= File.extname(path)
+    end
+    
+    def dir
+      @dir ||= File.dirname(path)
+    end
+    
+    def header?
+      ext == '.h' || ext == '.hpp'
+    end
+    
+    def each(&blk)
+      depending_headers.each(&blk)
+      depending_sources.each(&blk)
+    end
+    
+    def all_related_sources
+      enum_for(:dfs).to_set
+    end
+    
+    def depending_headers
+      @depending_headers ||= make_depending_headers
+    end
+    
+    def depending_sources
+      @depending_sources ||= make_depending_sources
+    end
+    
+    private
+    def make_depending_headers
+      headers = IO.read(path).toutf8.scan(/^#\s*include\s*"([^"]*)"$/i)
+      headers.map {|header_name| @sources[header_name[0]] }.compact
+    end
+    
+    def make_depending_sources
+      depending_headers.map {|h| find_source(h) }.compact
+    end
+    
+    def find_source(h)
+      c = h_to_c(h)
+      cpp = h_to_cpp(h)
+      
+      if c && cpp
+        raise FileNameConflictError, %_both "#{c.path}" and "#{cpp.path}" exists for header "#{h.path}"_
+      end
+      
+      c || cpp
+    end
+    
+    def h_to_c(h)
+      @sources[h.path.gsub(h.ext, '.c')]
+    end
+    
+    def h_to_cpp(h)
+      @sources[h.path.gsub(h.ext, '.cpp')]
+    end
+  end
+
   class FileNameConflictError < StandardError
   end
 end
 
-class Source
-  attr_reader :path
-  
-  include Enumerable
-  
-  def initialize(sources, path)
-    @sources = sources
-    @path = path
-  end
-  
-  alias to_s path
-  
-  def name
-    @name ||= File.basename(path)
-  end
-  
-  def ext
-    @ext ||= File.extname(path)
-  end
-  
-  def dir
-    @dir ||= File.dirname(path)
-  end
-  
-  def header?
-    ext == '.h' || ext == '.hpp'
-  end
-  
-  def each(&blk)
-    depending_headers.each(&blk)
-    depending_sources.each(&blk)
-  end
-  
-  def all_related_sources
-    enum_for(:dfs).to_set
-  end
-  
-  def depending_headers
-    @depending_headers ||= make_depending_headers
-  end
-  
-  def depending_sources
-    @depending_sources ||= make_depending_sources
-  end
-  
-  private
-  def make_depending_headers
-    headers = IO.read(path).toutf8.scan(/^#\s*include\s*"([^"]*)"$/i)
-    headers.map {|header_name| @sources[header_name[0]] }.compact
-  end
-  
-  def make_depending_sources
-    depending_headers.map {|h| find_source(h) }.compact
-  end
-  
-  def find_source(h)
-    c = h_to_c(h)
-    cpp = h_to_cpp(h)
-    
-    if c && cpp
-      raise "both c and cpp exists for header \"#{h.path}\""
-    end
-    
-    c || cpp
-  end
-  
-  def h_to_c(h)
-    @sources[h.path.gsub(h.ext, '.c')]
-  end
-  
-  def h_to_cpp(h)
-    @sources[h.path.gsub(h.ext, '.cpp')]
-  end
-end
-
-def main
+if __FILE__ == $0
   m = Mukumufu.new
   m.calculate
   
@@ -218,5 +223,3 @@ def main
     open('Makefile.inc.txt', 'w') {|f| m.write f }
   end
 end
-
-main if __FILE__ == $0
