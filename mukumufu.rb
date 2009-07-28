@@ -53,7 +53,7 @@ class Mukumufu
         hhdeps[h.path] = h.depending_headers
       else
         c = source
-        osdeps[obj_path(c.name)] = [c]
+        osdeps[obj_path(c)] = [c]
         shdeps[c] = c.depending_headers
       end
     end
@@ -69,8 +69,8 @@ class Mukumufu
   end
   
   private
-  def obj_path(name)
-    "$(OBJDIR)/#{name.gsub(/\.c\z/, '.$(O)')}"
+  def obj_path(c)
+    "$(OBJDIR)/#{c.name.gsub(c.ext, '.$(O)')}"
   end
   
   def file_list(name, list, separator)
