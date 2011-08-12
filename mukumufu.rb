@@ -1,225 +1,891 @@
-# Makefile.inc.txtを生成する。
-# 内容は以下のとおり：
-#   ・OBJS = main.cに必要なモジュール(obj)
-#   ・.hファイルの.hファイルへの依存関係
-#   ・.cファイルの.hファイルへの依存関係
-#   ・.objファイルの.cファイルへの依存関係
+#!/usr/bin/env ruby
 
-require 'set'
+# coding: utf-8
+
+=begin
+* mukumufu version 2 (一から書き直してテストつけた版) *
+
+このスクリプトの機能はふたつ。
+
+== Makefile.inc.txtの生成 ==
+
+mukumufu.rbを引数なしで起動すると、Makefile.inc.txtを生成する。
+
+  $ ./mukumufu.rb
+  > mukumufu.rb
+
+Makefile.inc.txtの内容は以下のとおり：
+
+  ・OBJS = コンパイルが必要なファイル
+  ・CFLAGS_INCLUDE_DIRS = #includeするディレクトリのフラグ
+  ・hoge.h: fuga.h
+  ・hoge.c: hoge.h
+  ・hoge.obj: hoge.c
+
+生成はsrcフォルダのmain.cから依存関係をたどって行われる。
+
+仮定しているディレクトリ構成はこんなかんじ。
+
+  src/
+    hoge/
+      fuga.h
+      fuga.c
+    foo/
+      bar.h
+      bar.cpp
+      baz.h
+      baz.c
+    moga.c
+    main.c
+  mukumufu.rb
+  Makefile (ユーザが用意、Makefile.inc.txtを読み込む)
+  Makefile.inc.txt (このスクリプトが生成)
+
+つまり、こんなルール。
+
+  ・foo.hがあったらfoo.cかfoo.cppがそのモジュールの本体
+  ・フォルダ分けは自由にできるが、ファイル名がかぶってはいけない
+    (モジュールの名前は唯一)
+
+後者のルールはいまどき古いとは思うが、名前空間がないC言語に合わせた。
+
+== ソースの関係を調査 ==
+
+mukumufuはソースコードの関係を調べるツールとしても使える。
+
+  mukumufu.rb --list hoge
+  mukumufu.rb -l hoge
+
+hogeという名前で始まるソースファイルを一覧する。
+
+  mukumufu.rb --include hoge.h
+  mukumufu.rb -i hoge.h
+
+hoge.hが直接または間接に#includeしているファイルを調べる。
+
+== 図の出力 ==
+
+  mukumufu.rb --graph
+  mukumufu.rb -g
+
+GraphvizのDOT形式で依存関係を出力する。
+=end
+
 require 'enumerator'
 require 'kconv'
+require 'set'
+require 'forwardable'
 
-module Enumerable
-  def dfs(visited = Set.new, &blk)
-    return if visited.include?(self)
+# requires :each_neighbor method
+module Traversable
+  def dfs
+    visited = Set.new
+    stack = [self]
     
-    blk.call self
-    visited << self
+    while node = stack.pop
+      next if visited.include?(node)
+      visited << node
+      
+      yield node
+      
+      node.each_neighbor {|x| stack.push x }
+    end
     
-    each {|x| x.dfs(visited, &blk) }
+    visited
   end
 end
 
-class Mukumufu
-  attr_reader :objs, :includes, :source_header_dependencies, :object_source_dependencies, :header_header_dependencies
+module Mukumufu
+
+# represents a code file
+# Traversable as a node in a dependency tree with SourceList
+class Source
+  include Traversable
   
-  def write(f = STDOUT)
-    calculate unless @calculated
-    
-    f.puts objs
-    f.puts
-    f.puts header_header_dependencies
-    f.puts
-    f.puts source_header_dependencies
-    f.puts
-    f.puts object_source_dependencies
+  attr_reader :path, :dirname, :basename
+  alias tree dirname
+
+  def initialize(list, path, content=nil)
+    @list = list
+    @path = normalize_path(path)
+    @content = content && content.toutf8
+    @dirname, @basename = File.split(path)
   end
   
-  def calculate
-    sources = Sources.new(Dir['src/**/*.{c,h,cpp,hpp}'])
-    
-    includes = sources.header_dirs
-    
-    hhdeps = {}
-    shdeps = {}
-    osdeps = {}
-    
-    main = sources['main.c']
-    all = main.all_related_sources
-    
-    all.each do |source|
-      if source.header?
-        h = source
-        hhdeps[h.path] = h.depending_headers
-      else
-        c = source
-        osdeps[obj_path(c)] = [c]
-        shdeps[c] = c.depending_headers
-      end
+  def to_s
+    @path
+  end
+  
+  def inspect
+    sprintf '#<%s:%#x @path="%s", @content=%s>', self.class.name, hash, @path, @content ? '"..."' : 'nil'
+  end
+  
+  def pretty_print(q)
+    q.object_group(self) do
+      q.breakable
+      q.text '@path='
+      q.pp @path
+      q.comma_breakable
+      q.text '@content='
+      q.text(@content ? '"..."' : 'nil')
     end
-    
-    objs = osdeps.keys
-    
-    @objs = file_list('OBJS', objs, %_ \\\n  _)
-    @header_header_dependencies = dep_list(hhdeps)
-    @source_header_dependencies = dep_list(shdeps)
-    @object_source_dependencies = dep_list(osdeps, compile_command(includes))
-    @calculated = true
-    self
+  end
+  
+  def find_source
+    raise ArgumentError, "'#{self}' is not a header" unless !c? && h?
+    @list.find_source(name)
+  end
+  
+  # getters
+  def content
+    @content ||= IO.read(path).toutf8
+  end
+  
+  def name
+    @name ||= basename[0..-extname.size-1]
+  end
+  
+  def extension
+    extname[1..-1]
+  end
+  
+  # preds
+  def c?
+    path_matches?(/\.(?:m|c(?:c|pp|xx)?)\z/i)
+  end
+  
+  def cxx?
+    path_matches?(/\.c(?:c|pp|xx)\z/i)
+  end
+  
+  def h?
+    path_matches?(/\.(?:h|hh|hpp|hxx|inc)\z/i)
+  end
+  
+  # traversing
+  def each_neighbor(&blk)
+    each_depending_header(&blk)
+    each_depending_source(&blk)
+  end
+  
+  def each_depending_header(&blk)
+    depending_headers.each(&blk)
+  end
+  
+  def each_depending_source(&blk)
+    depending_sources.each(&blk)
+  end
+  
+  def depending_headers
+    @depending_headers ||= make_depending_headers
+  end
+
+  def depending_sources
+    @depending_sources ||= make_depending_sources
+  end
+  
+  def depending_header_names
+    @depending_header_names ||= scan_includes
+  end
+  
+  def all_related_sources
+    dfs {}.to_a
   end
   
   private
-  def obj_path(c)
-    "$(OBJDIR)/#{c.name.gsub(c.ext, '.$(O)')}"
+  def normalize_path(path)
+    path.gsub(/[\/\\]+/, '/')
   end
   
-  def file_list(name, list, separator)
-    str = (["#{name} ="] + list.sort).join(separator)
-    str
+  def path_matches?(matcher)
+    matcher === path
   end
   
-  def dep_list(hash, command=nil)
-    command &&= "\n\t#{command}\n"
-    
-    str = hash.
-      reject {|k,v| v.empty? }.
-      map {|c,h| "#{c}: #{h.map {|x| x.to_s }.sort.join(' ')}#{command}" }.
-      sort.
-      join("\n")
-    str
+  def extname
+    File.extname(basename)
   end
   
-  def compile_command(includes)
-    inc = includes.map {|x| "-I#{x}" }.join(" ")
-    o = "$(CC_OBJ_OUT_FLAG)$@ -c $?"
-    "$(CC) $(CFLAGS) #{inc} #{o}"
+  def make_depending_headers
+    hs = depending_header_names.map {|d| @list[d] }
+    hs.compact!
+    hs
   end
-
-  class Sources
-    include Enumerable
-    
-    def initialize(files)
-      @sources = files.map {|f| Source.new(self, f) }
-    end
-    
-    def header_dirs
-      @header_dirs ||= make_header_dirs
-    end
-    
-    def [](name)
-      @index_cache ||= {}
-      @index_cache[name] ||= find_file(name)
-    end
-    
-    def each(&blk)
-      @sources.each(&blk)
-    end
-    
-    private
-    def make_header_dirs
-      @sources.map {|s| s.dir if s.header? }.compact.sort.uniq
-    end
-    
-    def find_file(str)
-      files = @sources.select {|s| s.path == str || s.name == str }
-      
-      case files.size
-      when 1
-        files[0]
-      when 0
-        nil
-      else
-        raise FileNameConflictError, "file name conflict: #{files.map {|x| x.path }.inspect}"
-      end
-    end
+  
+  def make_depending_sources
+    cs = depending_headers.map {|d| d.find_source }
+    cs.compact!
+    cs
   end
-
-  class Source
-    attr_reader :path
-    
-    include Enumerable
-    
-    def initialize(sources, path)
-      @sources = sources
-      @path = path
-    end
-    
-    alias to_s path
-    
-    def name
-      @name ||= File.basename(path)
-    end
-    
-    def ext
-      @ext ||= File.extname(path)
-    end
-    
-    def dir
-      @dir ||= File.dirname(path)
-    end
-    
-    def header?
-      ext == '.h' || ext == '.hpp'
-    end
-    
-    def each(&blk)
-      depending_headers.each(&blk)
-      depending_sources.each(&blk)
-    end
-    
-    def all_related_sources
-      enum_for(:dfs).to_set
-    end
-    
-    def depending_headers
-      @depending_headers ||= make_depending_headers
-    end
-    
-    def depending_sources
-      @depending_sources ||= make_depending_sources
-    end
-    
-    private
-    def make_depending_headers
-      headers = IO.read(path).toutf8.scan(/^#\s*include\s*"([^"]*)"$/i)
-      headers.map {|header_name| @sources[header_name[0]] }.compact
-    end
-    
-    def make_depending_sources
-      depending_headers.map {|h| find_source(h) }.compact
-    end
-    
-    def find_source(h)
-      c = h_to_c(h)
-      cpp = h_to_cpp(h)
-      
-      if c && cpp
-        raise FileNameConflictError, %_both "#{c}" and "#{cpp}" exists for header "#{h}"_
-      end
-      
-      c || cpp
-    end
-    
-    def h_to_c(h)
-      @sources[h.path.gsub(h.ext, '.c')]
-    end
-    
-    def h_to_cpp(h)
-      @sources[h.path.gsub(h.ext, '.cpp')]
-    end
-  end
-
-  class FileNameConflictError < StandardError
+  
+  def scan_includes
+    ds = content.scan(/^\s*#\s*(?:include|import)\s*[<"]([^"<>]+)[>"]/i)
+    ds.flatten!
+    ds
   end
 end
+
+# consists of Sources
+class SourceList
+  include Enumerable
+
+  def initialize(*sources)
+    @sources = sources.map {|s| s.is_a?(String) ? Source.new(self, s) : s }
+  end
+  
+  def add(source)
+    @sources << source
+    self
+  end
+
+  def [](name)
+    dir, basename = File.split(name)
+    warn "SourceList#[]: #{name}#{' -> ' + basename if name != basename} queried" if $DEBUG
+    found = select {|s| s.basename == basename }
+    return nil if found.empty?
+    return found[0] if found.size == 1
+    if nearest = found.find {|s| s.dirname == dir }
+      return nearest
+    end
+    raise "multiple files found for '#{name}': conflicting\n  #{found.join "\n  "}"
+  end
+  
+  def find_source(name)
+    find_one {|s| s.name == name && s.c? }
+  end
+  
+  def size
+    @sources.size
+  end
+  
+  def empty?
+    @sources.empty?
+  end
+
+  def each(&blk)
+    @sources.each(&blk)
+  end
+  
+  private
+  def find_one(&blk)
+    srcs = select(&blk)
+    
+    case srcs.size
+    when 0
+      nil
+    when 1
+      srcs[0]
+    else
+      raise "multiple files found: conflicting\n  #{srcs.join "\n  "}"
+    end
+  end
+end
+
+# SourceList with a root Source node
+# Wraps SourceList to provide convenient methods
+class SourceTree
+  include Enumerable
+  extend Forwardable
+  
+  def_delegators :@list, :each, :[], :size, :empty?
+  
+  attr_reader :start
+
+  def initialize(dir_or_list, start, globber=Dir)
+    if dir_or_list.is_a?(String)
+      dir = dir_or_list
+      files = globber.glob("#{dir}/**/*.{m,c,cc,cpp,cxx,h,hh,hpp,hxx,inc}")
+      dir_or_list = SourceList.new(*files)
+    end
+    
+    @list = dir_or_list
+
+    roots = @list.select {|s| s.name == start || s.path == start || s.basename == start }
+    raise ArgumentError, "'#{start}' not found" if roots.empty?
+
+    if roots.size == 1
+      @start = roots[0]
+    else
+      # prefer C file
+      cs = roots.select {|s| s.c? }
+      raise ArgumentError, "ambiguous name '#{start}':\n  #{roots.join "\n  "}" if cs.size != 1
+      @start = cs[0]
+    end
+  end
+  
+  def files_to_compile
+    cs
+  end
+  
+  def include_dirs
+    hs.map {|h| h.dirname }.uniq
+  end
+  
+  def cs
+    files.select {|s| s.c? }
+  end
+  
+  def hs
+    files.select {|s| s.h? }
+  end
+  
+  def files
+    @files ||= @start.all_related_sources
+  end
+end
+
+end # module Mukumufu
 
 if __FILE__ == $0
-  m = Mukumufu.new
-  m.calculate
-  
-  if ARGV.include?('-n')
-    m.write
-  else
-    open('Makefile.inc.txt', 'w') {|f| m.write f }
+  if !ARGV.delete('--test')
+    require 'erb'
+    require 'optparse'
+    
+    Version = 'v2'
+    
+    class Mukumufu::Main
+      def self.main(*args)
+        new(*args).main
+      end
+      
+      def initialize(erb_template_line)
+        dir = 'src'
+        start = 'main'
+        graph = false
+        raw_graph = false
+        out = nil
+        default_out = 'Makefile.inc.txt'
+        
+        ARGV.options do |o|
+          o.on('-d', '--srcdir=DIR', "root src directory (default: #{dir.inspect})") {|a| dir = a }
+          o.on('-s', '--start=START', "file to be scanned first (defaults to #{start.inspect})") {|a| start = a }
+          o.on('-o', '--out=FILENAME', "output (default: #{default_out.inspect})") {|a| out = a }
+          o.on('-g', '--graph', "generate a DOT file (default output set to '-' if specified)") {|a| graph = a }
+          o.on('-r', '--raw-graph', "show #include dependency when generate a DOT file (implies --graph)") {|a| raw_graph = a; graph = true }
+          
+          o.on_tail("-h", "--help", "show this message") do
+            puts o
+            exit
+          end
+          
+          o.on_tail('--test', 'run tests') {}
+          
+          o.parse!
+        end
+        
+        @erb_template_line = erb_template_line
+        @dir = dir
+        @start = start
+        @out = out || (graph ? '-' : default_out)
+        @graph = graph
+        @raw_graph = raw_graph
+      end
+      
+      def main
+        @tree = Mukumufu::SourceTree.new(@dir, @start)
+        
+        if @out == '-'
+          @io = STDOUT
+          run
+        else
+          open(@out, 'w') do |f|
+            @io = f
+            run
+          end
+        end
+      end
+      
+      private
+      def run
+        if @graph
+          generate_graph
+        else
+          generate_makefile
+        end
+      end
+      
+      def generate_makefile
+        tree = @tree
+        objs = {}
+        
+        tree.files_to_compile.each do |c|
+          objs[c] = "$(OBJDIR)/#{c.name}.$(O)"
+        end
+        
+        result = eval(ERB.new(DATA.read, nil, '%').src, binding, __FILE__, @erb_template_line)
+        
+        @io.print(result)
+      end
+      
+      def generate_graph
+        @io.puts "// Try the 'tred' tool in the Graphviz to get a less cluttered result"
+        @io.puts "// example: mukumufu.rb --graph | tred | dot -Tgif -odeps.gif"
+        @io.puts 'digraph {'
+        @io.puts '  overlap = false;'
+        @io.puts '  rankdir = LR;'
+        @io.puts '  node [style = filled, fontcolor = "#123456", fillcolor = white, fontsize = 30, fontname="Arial, Helvetica"];'
+        @io.puts '  edge [color = "#661122"];'
+        @io.puts 'bgcolor = "transparent";'
+        
+        sources, headers, links = collect_nodes_for_graph
+        
+        @io.puts ''
+        
+        @io.puts '// sources'
+        sources.each do |s|
+          @io.puts %{  "#{s}" [label = "#{s}", shape = box];}
+        end
+        
+        @io.puts ''
+        @io.puts '// headers'
+        
+        (headers - sources).each do |s|
+          @io.puts %{  "#{s}" [label = "#{s}", shape = ellipse];}
+        end
+        
+        links.each do |link|
+          @io.puts link
+        end
+
+        @io.puts '}'
+      end
+      
+      def collect_nodes_for_graph
+        sources = Set.new
+        headers = Set.new
+        links = Set.new
+        
+        if @raw_graph
+          get_name = proc {|s| s.path }
+          each = :each_depending_header
+        else
+          get_name = proc {|s| File.join(s.dirname, s.name) }
+          each = :each_neighbor
+        end
+        
+        @tree.files.each do |s|
+          name = get_name[s]
+          (s.c? ? sources : headers) << name
+        
+          s.__send__(each) do |t|
+            tname = get_name[t]
+            next if name == tname
+            links << %[  "#{name}" -> "#{tname}";]
+          end
+        end
+        
+        headers.subtract(sources)
+        
+        return sources, headers, links
+      end
+    end
+    
+    # main is called at the end of this big else clause
+  else # test
+    require 'rubygems'
+    require 'shoulda'
+    
+    begin
+      require 'redgreen'
+      require 'win32console'
+    rescue LoadError
+    end
+    
+    include Mukumufu
+    
+    module Taiyaki
+      def setup_taiyaki(list)
+        @komugikoh = make_header(list, 'komugiko')
+        @kawah, @kawac = @kawapair = make_pair(list, 'kawa', 'komugiko')
+        @azukih, @azukic = @azukipair = make_pair(list, 'azuki')
+        @ankoh, @ankoc = @ankopair = make_pair(list, 'anko', 'azuki')
+        @taiyakih, @taiyakic = @taiyakipair = make_pair_sparse(list, 'taiyaki', 'kawa', 'anko')
+        @cs = [@kawac, @azukic, @ankoc, @taiyakic]
+        @hs = [@kawah, @azukih, @ankoh, @taiyakih, @komugikoh]
+        @all = @cs + @hs
+      end
+      
+      def taiyaki_check_deps
+        assert_same_elements [], @taiyakih.depending_header_names
+        assert_same_elements [@azukih.basename], @ankoh.depending_header_names
+        assert_same_elements [@komugikoh.basename], @kawah.depending_header_names
+        assert_same_elements [], @azukih.depending_header_names
+        assert_same_elements [], @komugikoh.depending_header_names
+        
+        @cs.each do |e|
+          if e.equal?(@taiyakic)
+            hs = [@kawah.basename, @ankoh.basename, @taiyakih.basename]
+          else
+            hs = ["#{e.name}.h"]
+          end
+          assert_same_elements hs, e.depending_header_names
+        end
+      end
+      
+      private
+      def make_header(list, n, *deps)
+        base = "#{n}.h"
+        path = "#{tree}#{base}"
+        body = make_inc(*deps)
+        h = Source.new(list, path, body)
+        
+        list.add h unless list.nil?
+        
+        assert_equal normalize_path(path), h.path
+        assert_equal base, h.basename
+        assert_equal n, h.name
+        assert_equal true, h.h?
+        assert_equal false, h.c?
+        assert_equal body, h.content
+        
+        h
+      end
+      
+      def make_source(list, n, *deps)
+        exts = %w/cpp cc c/
+        ext = exts[rand(exts.size)]
+        base = "#{n}.#{ext}"
+        path = "#{tree}#{base}"
+        body = make_inc(n, *deps)
+        c = Source.new(list, path, body)
+        
+        assert_equal normalize_path(path), c.path
+        assert_equal base, c.basename
+        assert_equal n, c.name
+        assert_equal false, c.h?
+        assert_equal true, c.c?
+        assert_equal body, c.content
+        
+        list.add c unless list.nil?
+        
+        c
+      end
+      
+      def normalize_path(path)
+        path.gsub(/[\/\\]+/, '/')
+      end
+      
+      def make_pair(list, n, *deps)
+        return make_header(list, n, *deps), make_source(list, n)
+      end
+      
+      def make_pair_sparse(list, n, *deps)
+        return make_header(list, n), make_source(list, n, *deps)
+      end
+      
+      def tree
+        if rand(3) == 0
+          dirs = ['hoge', 'fuga', '', '.']
+          Array.new(rand(4)) { dirs[rand(dirs.size)] }.join('/') + '/'
+        end
+      end
+      
+      def make_inc(*deps)
+        parens = %w/<> ""/
+        open, close = parens[rand(parens.size)].split(//)
+        deps.map {|d| "##{spc}#{incl}#{spc}#{open}#{d}.h#{close}" }.join("\n")
+      end
+      
+      def spc
+        spaces = [' ', "\t"]
+        Array.new(rand(5)) { spaces[rand(spaces.size)] }.join
+      end
+      
+      def incl
+        k = 'include'
+        shuffle_case k
+        k
+      end
+      
+      private
+      def shuffle_case(str)
+        rand(str.size).times do
+          i = rand(str.size)
+          str[i] = str[i, 1].upcase
+        end
+      end
+    end
+
+    class SourceTest < Test::Unit::TestCase
+      include Taiyaki
+      
+      context 'a' do
+        context 'filename' do
+          setup do
+            @m = Source.new(nil, 'hoge/fuga/moga.cpp')
+            @b = Source.new(nil, 'foo/bar/baz.c')
+            @f = Source.new(nil, 'fred.h')
+            @c = Source.new(nil, 'cat.jpg')
+            @all = [@m, @b, @f, @c]
+          end
+          
+          should 'path' do
+            assert_equal 'hoge/fuga/moga.cpp', @m.path
+            assert_equal 'foo/bar/baz.c', @b.path
+            assert_equal 'fred.h', @f.path
+            assert_equal 'cat.jpg', @c.path
+          end
+          
+          should 'name' do
+            assert_equal 'moga', @m.name
+            assert_equal 'baz', @b.name
+            assert_equal 'fred', @f.name
+            assert_equal 'cat', @c.name
+          end
+          
+          should 'tree' do
+            assert_equal 'hoge/fuga', @m.tree
+            assert_equal 'foo/bar', @b.tree
+            assert_equal '.', @f.tree
+            assert_equal '.', @c.tree
+          end
+          
+          should 'basename' do
+            assert_equal 'moga.cpp', @m.basename
+            assert_equal 'baz.c', @b.basename
+            assert_equal 'fred.h', @f.basename
+            assert_equal 'cat.jpg', @c.basename
+          end
+          
+          should 'basename+tree' do
+            @all.each do |s|
+              if s.tree == '.'
+                assert_equal s.path, s.basename
+              end
+            end
+          end
+          
+          should 'extname' do
+            assert_equal 'cpp', @m.extension
+            assert_equal 'c', @b.extension
+            assert_equal 'h', @f.extension
+            assert_equal 'jpg', @c.extension
+          end
+          
+          should 'type' do
+            assert_equal true, @m.c?
+            assert_equal false, @m.h?
+            
+            assert_equal true, @b.c?
+            assert_equal false, @b.h?
+
+            assert_equal false, @f.c?
+            assert_equal true, @f.h?
+
+            assert_equal false, @c.c?
+            assert_equal false, @c.h?
+          end
+        end
+      end
+      
+      context 'many' do
+        context 'deps alone' do
+          setup do
+            setup_taiyaki(nil)
+          end
+          
+          should 'detect #include' do
+            taiyaki_check_deps
+          end
+        end
+      end
+    end
+    
+    class SourceListTest < Test::Unit::TestCase
+      context 'alone' do
+        setup do
+          @e0 = SourceList.new
+          @e1 = SourceList.new('hoge.h')
+          @e2 = SourceList.new('hoge.h', 'hoge.c')
+          @all = [@e0, @e1, @e2]
+        end
+        
+        should 'empty?' do
+          assert_equal true, @e0.empty?
+          assert_equal false, @e1.empty?
+          assert_equal false, @e2.empty?
+        end
+
+        should 'size' do
+          assert_equal 0, @e0.size
+          assert_equal 1, @e1.size
+          assert_equal 2, @e2.size
+        end
+        
+        should 'index nonexistent' do
+          assert_nil @e0['foo.c']
+          assert_nil @e1['bar.c']
+          assert_nil @e2['baz.c']
+        end
+        
+        should 'find_source' do
+          assert_nil @e1['hoge.h'].find_source
+          assert_same @e2['hoge.c'], @e2['hoge.h'].find_source
+          assert_raise(ArgumentError) { @e2['hoge.c'].find_source }
+        end
+      end
+    end
+
+    class SourceListWithSourceTest < Test::Unit::TestCase
+      include Taiyaki
+      
+      context 'source-list' do
+        setup do
+          @list = SourceList.new
+          setup_taiyaki @list
+        end
+        
+        should 'elems' do
+          assert_same_elements @all, @list
+        end
+        
+        should 'deps' do
+          taiyaki_check_deps
+        end
+        
+        should 'index' do
+          assert_nil @list['foo.c']
+          
+          @all.each do |s|
+            assert_same s, @list[s.path]
+            assert_same s, @list[s.basename]
+          end
+        end
+        
+        should 'depending_headers' do
+          assert_same_elements [@taiyakih, @kawah, @ankoh], @taiyakic.depending_headers
+          assert_same_elements [@ankoh], @ankoc.depending_headers
+          assert_same_elements [@kawah], @kawac.depending_headers
+          assert_same_elements [@azukih], @azukic.depending_headers
+          
+          assert_same_elements [], @taiyakih.depending_headers
+          assert_same_elements [@azukih], @ankoh.depending_headers
+          assert_same_elements [@komugikoh], @kawah.depending_headers
+          assert_same_elements [], @azukih.depending_headers
+          assert_same_elements [], @komugikoh.depending_headers
+        end
+        
+        should 'all_related_sources' do
+          assert_same_elements @all, @taiyakic.all_related_sources
+          assert_same_elements [@ankoc, @azukic, @ankoh, @azukih], @ankoc.all_related_sources
+          assert_same_elements [@kawac, @kawah, @komugikoh], @kawac.all_related_sources
+          assert_same_elements [@azukic, @azukih], @azukic.all_related_sources
+          
+          assert_same_elements [@taiyakih], @taiyakih.all_related_sources
+          assert_same_elements [@ankoh, @azukih, @azukic], @ankoh.all_related_sources
+          assert_same_elements [@kawah, @komugikoh], @kawah.all_related_sources
+          assert_same_elements [@azukih], @azukih.all_related_sources
+          assert_same_elements [@komugikoh], @komugikoh.all_related_sources
+        end
+        
+        should 'find_source' do
+          assert_same @taiyakic, @taiyakih.find_source
+          assert_same @ankoc, @ankoh.find_source
+          assert_same @kawac, @kawah.find_source
+          assert_same @azukic, @azukih.find_source
+          assert_nil @komugikoh.find_source
+          
+          @cs.each {|s| assert_raise(ArgumentError) { s.find_source } }
+        end
+      end
+    end
+    
+    class SourceTreeTest < Test::Unit::TestCase
+      include Taiyaki
+      
+      context 'source-tree' do
+        setup do
+          @list = SourceList.new
+          setup_taiyaki @list
+        end
+        
+        should 'deps' do
+          taiyaki_check_deps
+        end
+        
+        should 'files_to_compile' do
+          test_files_to_compile @cs, 'taiyaki'
+          test_files_to_compile [@ankoc, @azukic], 'anko'
+          test_files_to_compile [@kawac], 'kawa'
+          test_files_to_compile [@azukic], 'azuki'
+        end
+      end
+      
+      def test_files_to_compile(cs, start)
+        tree = SourceTree.new(@list, start)
+        assert_same_elements cs, tree.files_to_compile
+      end
+    end
   end
+
+  Mukumufu::Main.main(__LINE__ + 5) if defined? Mukumufu::Main
 end
+
+# erb template below
+__END__
+## This file is generated by mukumufu.rb v2
+#
+## Include this file in your Makefile like:
+#   Makefile.inc.txt:
+#       ruby mukumufu.rb
+#   include Makefile.inc.txt
+#
+## Required variables:
+#   OBJDIR
+#   O
+#   CC_OBJ_OUT_FLAG (-Fo in MSVC, -o in GCC)
+#
+## Customizable variables:
+#   CC
+#   CXX
+#   CFLAGS
+#   CXXFLAGS
+#
+## Variables defined in this file:
+#   OBJS
+#   CFLAGS_INCLUDE_DIRS
+#
+## example for MSVC:
+#   O = obj
+#   CC_OBJ_OUT_FLAG = -Fo
+#   OBJDIR = obj~
+#   $(OBJS): $(OBJDIR)
+#   $(OBJDIR):
+#   	mkdir $(OBJDIR)
+#
+# example for GCC:
+#   O = o
+#   CC_OBJ_OUT_FLAG = -o
+#   OBJDIR = obj~
+#   $(OBJS): $(OBJDIR)
+#   $(OBJDIR):
+#   	mkdir $(OBJDIR)
+
+OBJS = \
+<%= objs.map {|c,obj| "  #{obj}" }.sort.join(" \\\n") %>
+
+CFLAGS_INCLUDE_DIRS = \
+<%= tree.include_dirs.sort.map {|dir| "  -I#{dir}" }.sort.join(" \\\n") %>
+
+# header-header deps
+
+% tree.hs.sort_by {|h| h.path }.each do |h|
+%   ds = h.depending_headers
+%   next if ds.empty?
+<%=  h %>: <%= ds.map {|d| d.path }.sort.join(' ') %>
+% end
+
+# source-header deps
+
+% tree.cs.sort_by {|c| c.path }.each do |c|
+%   ds = c.depending_headers
+%   next if ds.empty?
+<%=  c %>: <%= ds.map {|d| d.path }.sort.join(' ') %>
+% end
+
+# object-source deps
+
+% objs.sort_by {|c,obj| obj }.each do |c,obj|
+<%= obj %>: <%= c %>
+	<%= c.cxx? ? '$(CXX) $(CXXFLAGS)' : '$(CC) $(CFLAGS)' %> $(CFLAGS_INCLUDE_DIRS) $(CC_OBJ_OUT_FLAG)<%= obj %> -c <%= c %>
+
+% end
