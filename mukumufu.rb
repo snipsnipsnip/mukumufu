@@ -102,14 +102,12 @@ module Mukumufu
 class Source
   include Traversable
   
-  attr_reader :path, :dirname, :basename
-  alias tree dirname
+  attr_reader :path
 
   def initialize(list, path, content=nil)
     @list = list
     @path = normalize_path(path)
     @content = content && content.toutf8
-    @dirname, @basename = File.split(path)
   end
   
   def to_s
@@ -142,12 +140,21 @@ class Source
   end
   
   def name
-    @name ||= basename[0..-extname.size-1]
+    basename[0..-extname.size-1]
+  end
+  
+  def basename
+    File.basename(path)
   end
   
   def extension
     extname[1..-1]
   end
+  
+  def dirname
+    File.dirname(path)
+  end
+  alias tree dirname
   
   # preds
   def c?
@@ -238,15 +245,9 @@ class SourceList
   end
 
   def [](name)
-    dir, basename = File.split(name)
+    basename = File.basename(name)
     warn "SourceList#[]: #{name}#{' -> ' + basename if name != basename} queried" if $DEBUG
-    found = select {|s| s.basename == basename }
-    return nil if found.empty?
-    return found[0] if found.size == 1
-    if nearest = found.find {|s| s.dirname == dir }
-      return nearest
-    end
-    raise "multiple files found for '#{name}': conflicting\n  #{found.join "\n  "}"
+    find_one {|s| s.basename == basename }
   end
   
   def find_source(name)
@@ -354,13 +355,15 @@ if __FILE__ == $0
         raw_graph = false
         out = nil
         default_out = 'Makefile.inc.txt'
+        ignore_head = []
         
         ARGV.options do |o|
           o.on('-d', '--srcdir=DIR', "root src directory (default: #{dir.inspect})") {|a| dir = a }
           o.on('-s', '--start=START', "file to be scanned first (defaults to #{start.inspect})") {|a| start = a }
           o.on('-o', '--out=FILENAME', "output (default: #{default_out.inspect})") {|a| out = a }
           o.on('-g', '--graph', "generate a DOT file (default output set to '-' if specified)") {|a| graph = a }
-          o.on('-r', '--raw-graph', "show #include dependency when generate a DOT file (implies --graph)") {|a| raw_graph = a; graph = true }
+          o.on('-r', '--raw-graph', "show #include dependency when generating a graph (implies --graph)") {|a| raw_graph = a; graph = true }
+          o.on('-i', '--ignore-head=NAME', "ignore references to the file when generating a graph") {|a| ignore_head << a }
           
           o.on_tail("-h", "--help", "show this message") do
             puts o
@@ -378,6 +381,7 @@ if __FILE__ == $0
         @out = out || (graph ? '-' : default_out)
         @graph = graph
         @raw_graph = raw_graph
+        @ignore_head = ignore_head
       end
       
       def main
@@ -455,20 +459,20 @@ if __FILE__ == $0
         links = Set.new
         
         if @raw_graph
-          get_name = proc {|s| s.path }
+          get_name = :basename
           each = :each_depending_header
         else
-          get_name = proc {|s| File.join(s.dirname, s.name) }
+          get_name = :name
           each = :each_neighbor
         end
         
         @tree.files.each do |s|
-          name = get_name[s]
+          name = s.__send__(get_name)
           (s.c? ? sources : headers) << name
         
           s.__send__(each) do |t|
-            tname = get_name[t]
-            next if name == tname
+            tname = t.__send__(get_name)
+            next if name == tname || @ignore_head.include?(tname)
             links << %[  "#{name}" -> "#{tname}";]
           end
         end
